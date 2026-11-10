@@ -31,6 +31,10 @@ For example, in a simulated snow window, a **16-tonne loader** with training unc
 | **AI tools** | Used ChatGPT during development to review implementation options, design test cases, and troubleshoot Power Query, Excel, and Power Automate. Checked the resulting logic against SQL control totals and simulated cases. |
 | **Testing and communication** | Tested data parsing, snapshot loading, and export verification. Presented the results as a briefing that shows the forecast window, the records affected, and what someone needs to confirm. [Tests](tests/) |
 
+![One-page Excel briefing with hourly flight traffic and supplier follow-up](assets/excel-briefing.png)
+
+*Example briefing archived as a PDF by Power Automate Desktop after the reconciliation checks passed.*
+
 ## Run the data pipeline
 
 From the repository root in Windows PowerShell, set up the Python environment and create local configuration.
