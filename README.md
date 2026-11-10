@@ -1,97 +1,65 @@
 # HEL Operations Intelligence
 
-Airport Performance Reporting & Automation — independent portfolio project.
+I built this independent portfolio project to turn Helsinki Airport flight schedules and hourly weather forecasts into an operations briefing. The Power BI dashboard shows when scheduled traffic peaks and which upcoming flights need weather review. The Excel briefing adds a supplier readiness check and an automated PDF archive.
 
-![HEL dashboard showing how flight flags change with the weather](assets/snow-demo.png)
+![Power BI dashboard showing simulated Helsinki flights, weather review flags, and snow supplier follow-up](assets/snow-demo.png)
 
-*Simulated winter weather showing how the dashboard flags snowfall, strong gusts, and freezing rain.*
+*Simulated winter conditions in Power BI. The purple snow flag identifies a window for supplier follow-up.*
 
-## Current stage
+In the saved briefing for **9 November 2026**, Helsinki had **411 scheduled flight records**. The busiest hour was **16:00 Helsinki time**, with **41 scheduled records**.
 
-The user completed live collection, parsing and PostgreSQL loading on Windows.
-Two initial Power BI pages now show traffic, source timestamps, status coverage
-and basic quality checks. The 4 November 2026 refresh reconciled SQL and Power BI:
-394 records, 94 without status and 0 basic quality flags. SQL-to-CSV export for
-Excel is prepared and locally tested; see docs/excel_step.md for the next steps.
-The Excel workbook, scheduled collection and briefing automation remain planned.
-Timestamp definitions are in docs/parser_step.md.
+## Procurement use case
 
-Keep your existing working-plan Markdown file. Move it into `docs/` if convenient.
+A snowfall forecast gives ground operations and procurement a specific window for checking whether the snow-clearing supplier is ready. I translated that question into an Excel check with explicit criteria and a record of the confirmation. The use case was inspired by Finavia’s historical apron snow-clearing procurement, Lot C. [Historical procurement notice](https://fi.openprocurements.com/tender/2019-finavia-oyj-n-helsinki-vantaan-lentoaseman-turvatarkastetun-alueen-talvikunnossapidon-lumen-aura/)
 
-## Setup on your Windows computer
+1. **Identify the window.** SQL flags upcoming flights that match a snowfall forecast. Excel finds the first flagged hour and shows how many arrivals and departures are scheduled in that window.
+2. **Record the supplier’s confirmation.** The reviewer enters the available loader weight and whether preseason training was confirmed. The input is keyed to the forecast window, so a different hour requires a fresh confirmation.
+3. **Check readiness and record the outcome.** Excel compares the entered weight with the project’s **18-tonne benchmark** and checks training separately. The briefing distinguishes an outstanding confirmation from a plan that meets both checks or needs follow-up. The result goes into the archived briefing and run log.
 
-Open the existing project folder in VS Code. Keep your existing `.venv`.
+For example, in a simulated snow window, a **16-tonne loader** with training unconfirmed triggers follow-up on both equipment and training. This gives the reviewer two specific questions to resolve with the supplier.
+
+## How I used the tools
+
+| Skill | How I applied it |
+| --- | --- |
+| **Python and APIs** | Captured Finavia flight XML and FMI hourly forecasts, validated incoming records, loaded snapshots into PostgreSQL, and exported the reporting data. [Python scripts](scripts/) |
+| **SQL and data modelling** | Modelled snapshots and flight observations in PostgreSQL, built views for the latest arrivals and departures, and joined flight schedules to forecasts by UTC hour. Helsinki local time is used for reporting. [Schema](sql/001_snapshot_tables.sql) · [Weather views](sql/008_fmi_weather.sql) |
+| **Analytics and data science concepts** | Aggregated flights by hour and direction to find traffic peaks. Used gusts, rainfall, and forecast symbols in rule-based weather classifications, with an Unknown category for insufficient forecast data. Checked the logic against simulated winter cases. [Weather rules](sql/008_fmi_weather.sql) |
+| **Power BI** | Used Power Query to load weather-enriched flight records and DAX measures to show flight totals, priority cases, and the first snow hour. Date, direction, weather level, and airport filters let reviewers inspect the underlying records. [Power Query source](powerbi/Flights_With_Weather.pq) |
+| **Excel and reporting controls** | Used Power Query to import the CSVs, then built a one-page briefing that reconciles Excel counts against SQL control totals. Formulas including `MINIFS`, `XLOOKUP`, and `COUNTIFS` identify the first snow window and its flight counts. [Export and SQL controls](scripts/export_excel.py) |
+| **Power Automate Desktop** | Automated the Excel refresh, checked the export manifest and reconciliation result, and saved a dated workbook, PDF, and run log when the checks passed. [PowerShell actions](automation/) |
+| **AI tools** | Used ChatGPT during development to review implementation options, design test cases, and troubleshoot Power Query, Excel, and Power Automate. Checked the resulting logic against SQL control totals and simulated cases. |
+| **Testing and communication** | Tested data parsing, snapshot loading, and export verification. Presented the results as a briefing that shows the forecast window, the records affected, and what someone needs to confirm. [Tests](tests/) |
+
+## Run the data pipeline
+
+From the repository root in Windows PowerShell, set up the Python environment and create local configuration.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-db.txt
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-If you already configured `.env`, keep it and do not copy the example over it.
-Open `.env` locally and replace only the placeholder API key with your Finavia
-subscription key. The default configuration requests arrivals and departures
-for HEL. The screenshot confirms the header name is `app_key`.
-
-Run from the project folder:
+Set `FINAVIA_API_KEY` in `.env` and use the `HEL` airport with the `all` flight type. Create a local PostgreSQL database named `hel_operations`. The scripts default to `127.0.0.1:5432` with user `postgres` and prompt for the database password if needed.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\fetch_finavia.py
+.\.venv\Scripts\python.exe scripts\load_postgres.py --init-db
+.\.venv\Scripts\python.exe scripts\fetch_fmi_weather.py --export
+.\.venv\Scripts\python.exe scripts\export_excel.py --verify-only
 ```
 
-Expected on success:
-- HTTP 200 and a valid XML document with root `flights`.
-- One XML file and one small metadata JSON file in `data/raw/`.
-- A console summary of XML sections, not an invented flight count.
+The verified CSVs and manifest are written to `data/processed/excel/`. The repository includes the Power Query source and the Power Automate script actions. The desktop reporting workflow uses a locally configured Power BI report, Excel workbook, and Power Automate Desktop flow.
 
-The metadata contains the source URL, collection time and structural information.
-It does not include request headers or your key. The XML is saved as received,
-not reformatted. If the API returns another schema, the script stops so we can
-inspect the documented format before changing the parser.
-
-## Project files
-
-| Path | Purpose |
-| --- | --- |
-| `AGENTS.md` | Instructions for coding assistance and project boundaries. |
-| `TASKS.md` | Verified progress, current task and next steps. |
-| `.env.example` | Safe configuration template; contains no real key. |
-| `.gitignore` | Keeps credentials, virtual environments and raw captures out of Git. |
-| `requirements.txt` | Direct Python dependencies. |
-| `scripts/fetch_finavia.py` | One-shot collector and XML structural summary. |
-| `tests/test_fetch_finavia.py` | Offline tests with simulated HTTP responses. |
-| `docs/data_source_notes.md` | What the screenshots establish and what still needs checking. |
-| `data/raw/` | Local XML captures and metadata; ignored by Git. |
-| `sql/`, `excel/`, `powerbi/`, `automation/` | Reserved for later working outputs. |
-
-## Verification
+## Tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests use synthetic XML and mock HTTP responses. They do not call Finavia or
-establish that a key is valid. Requirements record compatible major-version
-ranges; they are not a full lockfile.
+The collector and parser tests use mock HTTP responses and synthetic XML. PostgreSQL integration tests run when `HEL_TEST_DSN` points to an empty test database.
 
-## API behaviour
+## Data sources
 
-- HTTPS only, fixed Finavia gateway; never downgrade to the HTTP example.
-- The `app_key` is sent as a header, not a URL query parameter.
-- Redirects are not followed, avoiding accidental forwarding of the key.
-- A single request per run; no automatic retry or polling yet.
-- Connection/read timeout of 10/30 seconds, not a strict total runtime limit.
-- Invalid configuration, non-200 status, network errors, invalid XML and
-  unexpected XML roots produce a concise error and non-zero exit status.
-- An HTTP 200 with empty `flights` XML is saved for inspection, without claiming
-  there were zero movements.
-- Raw capture directories are local-only until data-use conditions are checked.
-
-## Next milestone
-
-Run scripts/export_excel.py and connect Excel Power Query to the fixed CSV files
-using docs/excel_step.md. Build independent Excel reconciliation and a briefing
-sheet. Define cross-snapshot movement identity before combined historical
-performance reporting; scheduled-event semantics still need confirmation.
-
-This is independent work using public data. It is not a Finnair or Finavia system.
-
+Flight schedules come from the Finavia Public Flights API and forecasts come from FMI's HARMONIE model for Helsinki Airport. [Finavia API portal](https://apiportal.finavia.fi/) · [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data)
