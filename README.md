@@ -2,6 +2,10 @@
 
 Airport Performance Reporting & Automation — independent portfolio project.
 
+![HEL dashboard showing how flight flags change with the weather](assets/snow-demo.png)
+
+*Simulated winter weather showing how the dashboard flags snowfall, strong gusts, and freezing rain.*
+
 ## Current stage
 
 The user completed live collection, parsing and PostgreSQL loading on Windows.
