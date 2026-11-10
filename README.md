@@ -6,8 +6,6 @@ I built this independent portfolio project to turn Helsinki Airport flight sched
 
 *Simulated winter conditions in Power BI. The purple snow flag identifies a window for supplier follow-up.*
 
-In the saved briefing for **9 November 2026**, Helsinki had **411 scheduled flight records**. The busiest hour was **16:00 Helsinki time**, with **41 scheduled records**.
-
 ## Procurement use case
 
 A snowfall forecast gives ground operations and procurement a specific window for checking whether the snow-clearing supplier is ready. I translated that question into an Excel check with explicit criteria and a record of the confirmation. The use case was inspired by Finavia’s historical apron snow-clearing procurement, Lot C. [Historical procurement notice](https://fi.openprocurements.com/tender/2019-finavia-oyj-n-helsinki-vantaan-lentoaseman-turvatarkastetun-alueen-talvikunnossapidon-lumen-aura/)
@@ -34,6 +32,7 @@ For example, in a simulated snow window, a **16-tonne loader** with training unc
 ![One-page Excel briefing with hourly flight traffic and supplier follow-up](assets/excel-briefing.png)
 
 *Example briefing archived as a PDF by Power Automate Desktop after the reconciliation checks passed.*
+In the saved briefing for **10 November 2026**, Helsinki had **401 scheduled flight records**. The busiest hour was **16:00 Helsinki time**, with **40 scheduled records**.
 
 ## Run the data pipeline
 
