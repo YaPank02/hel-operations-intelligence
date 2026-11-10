@@ -1,0 +1,3 @@
+-r requirements.txt
+# IANA time-zone data for Windows; used by zoneinfo.
+tzdata>=2025.1

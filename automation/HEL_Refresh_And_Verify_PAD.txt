@@ -1,0 +1,140 @@
+$ErrorActionPreference = 'Stop'
+$excel = $null
+$book = $null
+$result = 'REFRESH_FAILED'
+$exportDir = Join-Path '%ProjectRoot%' 'data\processed\excel'
+$workbookPath = Join-Path '%WorkingFolder%' 'HEL_Operations_Briefing.xlsx'
+$manifestPath = Join-Path $exportDir 'export_manifest.json'
+
+$specs = @(
+@{ File = 'flights_current.csv'; Sheet = 'Flights'; Table = 'tblFlights' },
+@{ File = 'sql_control_totals.csv'; Sheet = 'SQLControls'; Table = 'tblSQLControls' },
+@{ File = 'source_freshness.csv'; Sheet = 'Freshness'; Table = 'tblFreshness' }
+)
+
+function Release-ComReference($object) {
+if ($null -ne $object -and [Runtime.InteropServices.Marshal]::IsComObject($object)) {
+try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($object) }
+catch { }
+}
+}
+
+function Assert-ExportBundle($manifest, $directory, $items, $path, $originalHash) {
+if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $originalHash) {
+throw 'The export changed during this run. Run the flow again after exporting finishes.'
+}
+foreach ($item in $items) {
+$property = $manifest.files.PSObject.Properties[$item.File]
+if ($null -eq $property) { throw "Missing manifest entry: $($item.File)" }
+$entry = $property.Value
+if ($null -eq $entry.rows -or $entry.rows -lt 0 -or
+[string]$entry.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+throw "Invalid manifest entry: $($item.File)"
+}
+$csvPath = Join-Path $directory $item.File
+if ((Get-FileHash -LiteralPath $csvPath -Algorithm SHA256).Hash -ne $entry.sha256) {
+throw "Export file does not match its manifest: $($item.File). Rerun export_excel.py."
+}
+$rows = @(Import-Csv -LiteralPath $csvPath -Encoding UTF8)
+if ($rows.Count -ne $entry.rows) {
+throw "CSV row count does not match its manifest: $($item.File)"
+}
+foreach ($row in $rows) {
+if ([string]$row.export_id -cne [string]$manifest.export_id) {
+throw "Mixed or missing export IDs in $($item.File)"
+}
+}
+}
+if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $originalHash) {
+throw 'The export changed while its files were being checked. Run the flow again.'
+}
+}
+
+try {
+$manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+$manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$exportGuid = [guid]::Empty
+if ($manifest.schema_version -ne 1 -or
+-not [guid]::TryParse([string]$manifest.export_id, [ref]$exportGuid) -or
+$exportGuid -eq [guid]::Empty) {
+throw 'Missing or invalid export manifest. Rerun export_excel.py.'
+}
+Assert-ExportBundle $manifest $exportDir $specs $manifestPath $manifestHash
+if ($manifest.files.'flights_current.csv'.rows -le 0 -or
+$manifest.files.'source_freshness.csv'.rows -ne 2) {
+throw 'The export needs flight records and two source freshness rows.'
+}
+
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+$book = $excel.Workbooks.Open($workbookPath, 0, $false)
+if ($book.ReadOnly) {
+    throw 'The working workbook is read-only. Close other Excel windows.'
+}
+
+foreach ($item in $specs) {
+    $sheet = $null
+    $table = $null
+    $query = $null
+    $idColumn = $null
+    $idRange = $null
+    try {
+        $sheet = $book.Worksheets.Item($item.Sheet)
+        $table = $sheet.ListObjects.Item($item.Table)
+        $query = $table.QueryTable
+        $query.BackgroundQuery = $false
+        if (-not $query.Refresh($false)) {
+            throw "Refresh cancelled: $($item.Table)"
+        }
+        $excel.CalculateUntilAsyncQueriesDone()
+        if ($query.Refreshing) { throw "Refresh is still running: $($item.Table)" }
+
+        $expected = $manifest.files.PSObject.Properties[$item.File].Value
+        if ($table.ListRows.Count -ne $expected.rows) {
+            throw "Excel row count differs from the export: $($item.Table)"
+        }
+        $idColumn = $table.ListColumns.Item('export_id')
+        $idRange = $idColumn.DataBodyRange
+        if ($expected.rows -gt 0) {
+            if ($null -eq $idRange) { throw "Missing Excel export IDs: $($item.Table)" }
+            $values = $idRange.Value2
+            foreach ($value in $values) {
+                if ([string]$value -cne [string]$manifest.export_id) {
+                    throw "Excel loaded a different export: $($item.Table)"
+                }
+            }
+        }
+    }
+    finally {
+        Release-ComReference $idRange
+        Release-ComReference $idColumn
+        Release-ComReference $query
+        Release-ComReference $table
+        Release-ComReference $sheet
+    }
+}
+
+$excel.CalculateFull()
+Assert-ExportBundle $manifest $exportDir $specs $manifestPath $manifestHash
+$book.Save()
+$result = 'REFRESH_OK | Export ID: ' + [string]$manifest.export_id
+
+}
+catch {
+$result = 'REFRESH_FAILED: ' + $_.Exception.Message
+}
+finally {
+if ($null -ne $book) {
+try { $book.Close($false) }
+catch { $result = 'REFRESH_FAILED: Could not close working workbook.' }
+}
+if ($null -ne $excel) {
+try { $excel.Quit() }
+catch { $result = 'REFRESH_FAILED: Could not close refresh Excel instance.' }
+}
+Release-ComReference $book
+Release-ComReference $excel
+}
+
+Write-Output $result

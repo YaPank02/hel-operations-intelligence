@@ -1,0 +1,2 @@
+-r requirements-parser.txt
+psycopg[binary]>=3.3.6,<4

@@ -1,0 +1,40 @@
+# Credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local raw/derived data and logs
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Local editor/OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Power BI caches
+*.pbix.autosave
+*.pbix.tmp
+
+
+# Local update packs and working notes
+/HEL_Design_Pack/
+/HEL_Supplier_Update/
+/HEL_Operations_Intelligence_Working_Plan.md
+
+# Power BI project caches
+.pbi/
+*.abf

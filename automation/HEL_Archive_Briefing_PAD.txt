@@ -1,0 +1,416 @@
+$ErrorActionPreference = 'Stop'
+# Shared references let retry operations assign COM objects without pipeline enumeration.
+$office = @{}
+$status = @{ Step = 'Validate export'; BusyWaitMs = 0; RetryCount = 0 }
+$readyToPublish = $false
+$result = 'ARCHIVE_FAILED'
+$runStarted = [datetime]::UtcNow
+$refreshStatus = '%RefreshResult%'
+$exportDir = Join-Path '%ProjectRoot%' 'data\processed\excel'
+$workbookPath = Join-Path '%WorkingFolder%' 'HEL_Operations_Briefing.xlsx'
+$archiveRoot = Join-Path '%WorkingFolder%' 'archive'
+$manifestPath = Join-Path $exportDir 'export_manifest.json'
+$specs = @(
+    @{ File = 'flights_current.csv'; Sheet = 'Flights'; Table = 'tblFlights' },
+    @{ File = 'sql_control_totals.csv'; Sheet = 'SQLControls'; Table = 'tblSQLControls' },
+    @{ File = 'source_freshness.csv'; Sheet = 'Freshness'; Table = 'tblFreshness' }
+)
+
+function Release-ComReference($object) {
+    if ($null -ne $object -and [Runtime.InteropServices.Marshal]::IsComObject($object)) {
+        try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($object) }
+        catch { }
+    }
+}
+
+function Assert-ExportBundle($manifest, $directory, $items, $path, $originalHash) {
+    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $originalHash) {
+        throw 'The export changed during this run. Run the flow again after exporting finishes.'
+    }
+    foreach ($item in $items) {
+        $property = $manifest.files.PSObject.Properties[$item.File]
+        if ($null -eq $property) { throw "Missing manifest entry: $($item.File)" }
+        $entry = $property.Value
+        if ($null -eq $entry.rows -or $entry.rows -lt 0 -or
+            [string]$entry.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "Invalid manifest entry: $($item.File)"
+        }
+        $csvPath = Join-Path $directory $item.File
+        if ((Get-FileHash -LiteralPath $csvPath -Algorithm SHA256).Hash -ne $entry.sha256) {
+            throw "Export file does not match its manifest: $($item.File). Rerun export_excel.py."
+        }
+        $rows = @(Import-Csv -LiteralPath $csvPath -Encoding UTF8)
+        if ($rows.Count -ne $entry.rows) {
+            throw "CSV row count does not match its manifest: $($item.File)"
+        }
+        foreach ($row in $rows) {
+            if ([string]$row.export_id -cne [string]$manifest.export_id) {
+                throw "Mixed or missing export IDs in $($item.File)"
+            }
+        }
+    }
+    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $originalHash) {
+        throw 'The export changed while its files were being checked. Run the flow again.'
+    }
+}
+
+
+function Test-ExcelBusy($failure) {
+    $exception = $failure.Exception
+    while ($null -ne $exception) {
+        # RPC_E_CALL_REJECTED and RPC_E_SERVERCALL_RETRYLATER.
+        if ($exception.HResult -eq -2147418111 -or $exception.HResult -eq -2147417846) {
+            return $true
+        }
+        $exception = $exception.InnerException
+    }
+    return ($failure.Exception.Message -match 'RPC_E_CALL_REJECTED|RPC_E_SERVERCALL_RETRYLATER|0x80010001|0x8001010A')
+}
+
+function Invoke-ExcelCall([string]$label, [scriptblock]$operation) {
+    $status.Step = $label
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try {
+            & $operation | Out-Null
+            return
+        }
+        catch {
+            if (-not (Test-ExcelBusy $_)) { throw }
+            if ($timer.Elapsed.TotalSeconds -ge 10 -or $status.BusyWaitMs -ge 30000) {
+                throw "Excel stayed busy at '$label'. Close any Excel dialog and rerun the flow."
+            }
+            $status.RetryCount += 1
+            $status.BusyWaitMs += 500
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+function Wait-ExcelReady([string]$label, [bool]$waitForCalculation) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        Invoke-ExcelCall $label {
+            $office.Ready = $office.Excel.Ready
+            $office.CalculationState = $office.Excel.CalculationState
+        }
+        if ($office.Ready -and (-not $waitForCalculation -or $office.CalculationState -eq 0)) {
+            return
+        }
+        if ($timer.Elapsed.TotalSeconds -ge 20) {
+            throw "Excel did not become ready at '$label'."
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+try {
+    $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $exportGuid = [guid]::Empty
+    if ($manifest.schema_version -ne 1 -or
+        -not [guid]::TryParse([string]$manifest.export_id, [ref]$exportGuid) -or
+        $exportGuid -eq [guid]::Empty) {
+        throw 'Missing or invalid export manifest. Rerun export_excel.py.'
+    }
+    if ($refreshStatus -notmatch '^REFRESH_OK \| Export ID: ([0-9a-fA-F-]{36})' -or
+        $Matches[1] -cne [string]$manifest.export_id) {
+        throw 'The export differs from this run''s successful refresh. Rerun the whole flow.'
+    }
+    Assert-ExportBundle $manifest $exportDir $specs $manifestPath $manifestHash
+    if ($manifest.files.'flights_current.csv'.rows -le 0 -or
+        $manifest.files.'source_freshness.csv'.rows -ne 2) {
+        throw 'The export needs flight records and two source freshness rows.'
+    }
+
+    Invoke-ExcelCall 'Start archive Excel instance' { $office.Excel = New-Object -ComObject Excel.Application }
+    Invoke-ExcelCall 'Show archive Excel instance' { $office.Excel.Visible = $true }
+    Invoke-ExcelCall 'Configure archive Excel instance' { $office.Excel.DisplayAlerts = $false }
+    Invoke-ExcelCall 'Open working workbook read-only' { $office.Book = $office.Excel.Workbooks.Open($workbookPath, 0, $true) }
+    Wait-ExcelReady 'Wait for workbook opening' $false
+    Invoke-ExcelCall 'Finish pending queries' { $office.Excel.CalculateUntilAsyncQueriesDone() }
+    Invoke-ExcelCall 'Recalculate workbook' { $office.Excel.CalculateFull() }
+    Wait-ExcelReady 'Wait for workbook calculation' $true
+
+    foreach ($item in $specs) {
+        $office.Sheet = $null
+        $office.Table = $null
+        $office.Query = $null
+        $office.IdColumn = $null
+        $office.IdRange = $null
+        try {
+            Invoke-ExcelCall ("Read table state: " + $item.Table) {
+                $office.Sheet = $office.Book.Worksheets.Item($item.Sheet)
+                $office.Table = $office.Sheet.ListObjects.Item($item.Table)
+                $office.Query = $office.Table.QueryTable
+                $office.IsRefreshing = $office.Query.Refreshing
+                $office.RowCount = $office.Table.ListRows.Count
+            }
+            if ($office.IsRefreshing) { throw "A query is still running: $($item.Table)" }
+            $expected = $manifest.files.PSObject.Properties[$item.File].Value
+            if ($office.RowCount -ne $expected.rows) {
+                throw "Excel row count differs from the export: $($item.Table)"
+            }
+            Invoke-ExcelCall ("Read export IDs: " + $item.Table) {
+                $office.IdColumn = $office.Table.ListColumns.Item('export_id')
+                $office.IdRange = $office.IdColumn.DataBodyRange
+                $office.IdValues = $null
+                if ($null -ne $office.IdRange) { $office.IdValues = $office.IdRange.Value2 }
+            }
+            if ($expected.rows -gt 0) {
+                if ($null -eq $office.IdRange) { throw "Missing Excel export IDs: $($item.Table)" }
+                $values = $office.IdValues
+                foreach ($value in $values) {
+                    if ([string]$value -cne [string]$manifest.export_id) {
+                        throw "Excel contains a different export: $($item.Table)"
+                    }
+                }
+            }
+        }
+        finally {
+            Release-ComReference $office.IdRange
+            Release-ComReference $office.IdColumn
+            Release-ComReference $office.Query
+            Release-ComReference $office.Table
+            Release-ComReference $office.Sheet
+        }
+    }
+
+    Invoke-ExcelCall 'Read reconciliation result' {
+        $office.Reconciliation = $office.Book.Worksheets.Item('Reconciliation')
+        $office.ReconciliationValue = $office.Reconciliation.Range('B29').Value2
+    }
+    if ([string]$office.ReconciliationValue -cne 'MATCH') {
+        throw 'Reconciliation is not MATCH. No completed archive will be published.'
+    }
+    Invoke-ExcelCall 'Read briefing date and metrics' {
+        $office.Briefing = $office.Book.Worksheets.Item('Briefing')
+        $office.RawDate = $office.Briefing.Range('B3').Value2
+        $office.Metrics = $office.Briefing.Range('B6:B11').Value2
+        $office.MissingArrivalStatus = $office.Reconciliation.Range('B19').Value2
+        $office.MissingDepartureStatus = $office.Reconciliation.Range('B20').Value2
+        $office.Date1904 = $office.Book.Date1904
+    }
+    # Keep source-status QA in the run log even when the briefing displays weather counts.
+    $flightRecords = $office.Metrics.GetValue(1,1)
+    $missingStatusCount = [long]$office.MissingArrivalStatus + [long]$office.MissingDepartureStatus
+    $statusCoverage = if ($flightRecords -gt 0) { ($flightRecords - $missingStatusCount) / $flightRecords } else { '' }
+    $rawDate = $office.RawDate
+    if ($null -eq $rawDate -or $rawDate -is [string] -or $rawDate -is [bool]) {
+        throw 'Briefing!B3 must contain an Excel date.'
+    }
+    $serialDate = [double]$rawDate
+    if ($office.Date1904) { $serialDate += 1462 }
+    $reportDate = [datetime]::FromOADate($serialDate).ToString('yyyy-MM-dd')
+    $printArea = '$A$1:$K$21'
+    $weatherSummary = $null
+    Invoke-ExcelCall 'Read weather section title' {
+        $office.WeatherTitle = $office.Briefing.Range('A23').Value2
+    }
+    if ($office.WeatherTitle -ceq 'Upcoming weather and stand clearing') {
+        Invoke-ExcelCall 'Read weather and supplier lines' {
+            $office.WeatherLevels = $office.Briefing.Range('A24').Value2
+            $office.SnowWindow = $office.Briefing.Range('A25').Value2
+            $office.SupplierLine = $office.Briefing.Range('A26').Value2
+            $office.SupplierStatus = $office.Book.Worksheets.Item('Supplier Check').Range('B11').Value2
+        }
+        $levels = $office.WeatherLevels
+        $snow = $office.SnowWindow
+        $supplier = $office.SupplierLine
+        if ($levels -isnot [string] -or [string]::IsNullOrWhiteSpace($levels) -or
+            $snow -isnot [string] -or [string]::IsNullOrWhiteSpace($snow) -or
+            ($null -ne $supplier -and $supplier -isnot [string]) -or
+            [string]$office.SupplierStatus -cnotin @('', 'Awaiting confirmation', 'Follow-up required', 'Matches both checks')) {
+            throw 'The weather section did not calculate. Check Briefing A24:A26 and Supplier Check B11.'
+        }
+        $printArea = '$A$1:$K$26'
+        $weatherSummary = [ordered]@{
+            weather_levels = $levels
+            first_snow_window = $snow
+            supplier_status = [string]$office.SupplierStatus
+            supplier_follow_up = [string]$supplier
+        }
+    }
+    $status.Step = 'Prepare archive files'
+    $baseName = 'HEL_Operations_Briefing_' + $reportDate
+    $runStamp = $runStarted.ToString("yyyyMMdd'T'HHmmssfff'Z'")
+    $runId = [guid]::NewGuid().ToString('N')
+    $folderName = $reportDate + '_' + $runStamp + '_' + $runId.Substring(0,8)
+    [void][IO.Directory]::CreateDirectory($archiveRoot)
+    $stagingFolder = Join-Path $archiveRoot ('_incomplete_' + $runId)
+    [void][IO.Directory]::CreateDirectory($stagingFolder)
+    $finalFolder = Join-Path $archiveRoot $folderName
+    $inputsFolder = Join-Path $stagingFolder 'inputs'
+    [void][IO.Directory]::CreateDirectory($inputsFolder)
+    foreach ($item in $specs) {
+        Copy-Item -LiteralPath (Join-Path $exportDir $item.File) -Destination $inputsFolder
+    }
+    Copy-Item -LiteralPath $manifestPath -Destination $inputsFolder
+    $copiedManifest = Join-Path $inputsFolder 'export_manifest.json'
+    Assert-ExportBundle $manifest $inputsFolder $specs $copiedManifest $manifestHash
+    Assert-ExportBundle $manifest $exportDir $specs $manifestPath $manifestHash
+
+    $status.Step = 'Find Microsoft Print to PDF printer'
+    $pdfPrinterName = 'Microsoft Print to PDF'
+    Invoke-ExcelCall 'Read Excel printer name' { $office.PreviousPrinter = [string]$office.Excel.ActivePrinter }
+    if ($office.PreviousPrinter.StartsWith($pdfPrinterName + ' ', [StringComparison]::OrdinalIgnoreCase)) {
+        $office.PdfPrinter = $office.PreviousPrinter
+    }
+    else {
+        # Read the installed Excel-compatible port alias; do not change Windows settings.
+        $devices = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Devices'
+        $printerEntry = $devices.PSObject.Properties[$pdfPrinterName]
+        if ($null -eq $printerEntry -or [string]$printerEntry.Value -notmatch ',([^,]+:)$') {
+            throw 'Microsoft Print to PDF has no registered printer port. Select it in Excel File > Print and rerun.'
+        }
+        $pdfPort = $Matches[1].Trim()
+        $office.PdfPrinter = $pdfPrinterName + ' on ' + $pdfPort
+    }
+    Invoke-ExcelCall 'Select Microsoft Print to PDF' { $office.Excel.ActivePrinter = $office.PdfPrinter }
+
+    Invoke-ExcelCall 'Read briefing print settings' { $office.PageSetup = $office.Briefing.PageSetup }
+    Invoke-ExcelCall 'Set briefing print area' { $office.PageSetup.PrintArea = $printArea }
+    Invoke-ExcelCall 'Set A4 paper' { $office.PageSetup.PaperSize = 9 }
+    Invoke-ExcelCall 'Set landscape orientation' { $office.PageSetup.Orientation = 2 }
+    Invoke-ExcelCall 'Set print scaling' { $office.PageSetup.Zoom = $false }
+    Invoke-ExcelCall 'Fit briefing page width' { $office.PageSetup.FitToPagesWide = 1 }
+    Invoke-ExcelCall 'Fit briefing page height' { $office.PageSetup.FitToPagesTall = 1 }
+    Invoke-ExcelCall 'Activate Briefing sheet' { $office.Briefing.Activate() }
+    Wait-ExcelReady 'Wait for PDF preparation' $true
+    $xlsxPath = Join-Path $stagingFolder ($baseName + '.xlsx')
+    $pdfPath = Join-Path $stagingFolder ($baseName + '.pdf')
+    Invoke-ExcelCall 'Save archived workbook copy' { $office.Book.SaveCopyAs($xlsxPath) }
+    Wait-ExcelReady 'Wait after saving workbook copy' $true
+    Invoke-ExcelCall 'Print Briefing to PDF' {
+        # Explicit printer and output filename; never send this report to a physical printer.
+        $office.Briefing.PrintOut(
+            [Type]::Missing, [Type]::Missing, 1, $false,
+            $office.PdfPrinter, $true, $false, $pdfPath, $false
+        )
+    }
+    $status.Step = 'Wait for printed PDF'
+    $pdfTimer = [Diagnostics.Stopwatch]::StartNew()
+    $pdfReady = $false
+    $pdfEndMarker = [string][char]37 + [char]37 + 'EOF'
+    while ($pdfTimer.Elapsed.TotalSeconds -lt 30) {
+        $stream = $null
+        if (Test-Path -LiteralPath $pdfPath) {
+            try {
+                # Require a completed, closed PDF before hashing or moving the archive.
+                $stream = [IO.File]::Open($pdfPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+                if ($stream.Length -ge 5) {
+                    $header = New-Object byte[] 5
+                    [void]$stream.Read($header, 0, 5)
+                    $tailLength = [int][Math]::Min(1024, $stream.Length)
+                    [void]$stream.Seek(-$tailLength, [IO.SeekOrigin]::End)
+                    $tail = New-Object byte[] $tailLength
+                    [void]$stream.Read($tail, 0, $tailLength)
+                    $pdfReady = ($header[0] -eq 37 -and $header[1] -eq 80 -and
+                        $header[2] -eq 68 -and $header[3] -eq 70 -and $header[4] -eq 45 -and
+                        [Text.Encoding]::ASCII.GetString($tail).Contains($pdfEndMarker))
+                }
+            }
+            catch [IO.IOException] { $pdfReady = $false }
+            finally { if ($null -ne $stream) { $stream.Dispose() } }
+        }
+        if ($pdfReady) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not $pdfReady) {
+        throw 'Microsoft Print to PDF did not finish creating the PDF within 30 seconds.'
+    }
+    $status.Step = 'Check generated PDF and workbook'
+    $pdfHeader = [IO.File]::ReadAllBytes($pdfPath)
+    if ($pdfHeader.Length -lt 5 -or $pdfHeader[0] -ne 37 -or
+        $pdfHeader[1] -ne 80 -or $pdfHeader[2] -ne 68 -or
+        $pdfHeader[3] -ne 70 -or $pdfHeader[4] -ne 45) {
+        throw 'Excel did not produce a valid PDF header.'
+    }
+    if ((Get-Item -LiteralPath $xlsxPath).Length -eq 0) {
+        throw 'Excel did not produce a workbook copy.'
+    }
+
+    $status.Step = 'Write archive run log'
+    $log = [ordered]@{
+        schema_version = 1
+        status = 'COMPLETE'
+        run_started_at_utc = $runStarted.ToString('o')
+        generated_at_utc = [datetime]::UtcNow.ToString('o')
+        reporting_date_helsinki = $reportDate
+        display_timezone = 'Europe/Helsinki'
+        export_id = [string]$manifest.export_id
+        exported_at_utc = [string]$manifest.exported_at_utc
+        reconciliation = 'MATCH'
+        excel_busy_retries_before_cleanup = $status.RetryCount
+        report_metrics = [ordered]@{
+            flight_records = $flightRecords
+            arrivals = $office.Metrics.GetValue(2,1)
+            departures = $office.Metrics.GetValue(3,1)
+            records_without_status_text = $missingStatusCount
+            status_text_coverage_fraction = $statusCoverage
+            records_flagged_by_validation = $office.Metrics.GetValue(6,1)
+        }
+        source_freshness = @(Import-Csv -LiteralPath (Join-Path $inputsFolder 'source_freshness.csv') -Encoding UTF8)
+        freshness_policy = 'Source times recorded; no maximum source age enforced. This is a dated snapshot, not a live-data guarantee.'
+        artifacts = @(
+            @{ file = $baseName + '.xlsx'; sha256 = (Get-FileHash -LiteralPath $xlsxPath -Algorithm SHA256).Hash },
+            @{ file = $baseName + '.pdf'; sha256 = (Get-FileHash -LiteralPath $pdfPath -Algorithm SHA256).Hash }
+        )
+        inputs = $manifest.files
+        pdf_method = 'Microsoft Print to PDF'
+        pdf_printer = $office.PdfPrinter
+        pdf_sheet = 'Briefing'
+        pdf_print_area = $printArea.Replace('$','')
+        weather_supplier_summary = $weatherSummary
+        pdf_paper = 'A4 landscape; fit to one page'
+    }
+    $log | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stagingFolder 'run_log.json') -Encoding UTF8
+    $readyToPublish = $true
+}
+catch {
+    $result = 'ARCHIVE_FAILED at ' + $status.Step + ': ' + $_.Exception.Message
+}
+finally {
+    Release-ComReference $office.PageSetup
+    Release-ComReference $office.Briefing
+    Release-ComReference $office.Reconciliation
+    if ($null -ne $office.Excel -and $office.PreviousPrinter) {
+        try { Invoke-ExcelCall 'Restore Excel printer' { $office.Excel.ActivePrinter = $office.PreviousPrinter } }
+        catch {
+            $readyToPublish = $false
+            if ($result -eq 'ARCHIVE_FAILED') { $result = 'ARCHIVE_FAILED at printer restore: ' + $_.Exception.Message }
+            else { $result += ' | Cleanup: printer restore failed.' }
+        }
+    }
+    if ($null -ne $office.Book) {
+        try { Invoke-ExcelCall 'Close archive workbook' { $office.Book.Close($false) } }
+        catch {
+            $readyToPublish = $false
+            if ($result -eq 'ARCHIVE_FAILED') { $result = 'ARCHIVE_FAILED at workbook close: ' + $_.Exception.Message }
+            else { $result += ' | Cleanup: workbook close failed.' }
+        }
+    }
+    if ($null -ne $office.Excel) {
+        try { Invoke-ExcelCall 'Close archive Excel instance' { $office.Excel.Quit() } }
+        catch {
+            $readyToPublish = $false
+            if ($result -eq 'ARCHIVE_FAILED') { $result = 'ARCHIVE_FAILED at Excel close: ' + $_.Exception.Message }
+            else { $result += ' | Cleanup: Excel close failed.' }
+        }
+    }
+    Release-ComReference $office.Book
+    Release-ComReference $office.Excel
+}
+
+if ($readyToPublish) {
+    try {
+        $status.Step = 'Publish completed archive'
+        [IO.Directory]::Move($stagingFolder, $finalFolder)
+        $result = 'ARCHIVE_OK | Folder: ' + $finalFolder
+    }
+    catch {
+        $result = 'ARCHIVE_FAILED: Could not publish the archive: ' + $_.Exception.Message
+    }
+}
+
+Write-Output $result
