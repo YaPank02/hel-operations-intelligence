@@ -8,7 +8,7 @@ I built this independent portfolio project to turn Helsinki Airport flight sched
 
 ## Procurement use case
 
-A snowfall forecast gives ground operations and procurement a specific window for checking whether the snow-clearing supplier is ready. I translated that question into an Excel check with explicit criteria and a record of the confirmation. The use case was inspired by Finavia’s historical apron snow-clearing procurement, Lot C. [Historical procurement notice](https://fi.openprocurements.com/tender/2019-finavia-oyj-n-helsinki-vantaan-lentoaseman-turvatarkastetun-alueen-talvikunnossapidon-lumen-aura/)
+A snowfall forecast gives ground operations and procurement a specific window for checking whether the snow-clearing supplier is ready. I translated that question into an Excel check with explicit criteria and a record of the confirmation. The use case was inspired by Finavia’s historical apron snow-clearing procurement, Lot C. [Historical procurement notice](https://fi.openprocurements.com/tender/2019-finavia-oyj-n-helsinki-vantaa-lentoaseman-turvatarkastetun-alueen-talvikunnossapidon-lumen-aura/)
 
 1. **Identify the window.** SQL flags upcoming flights that match a snowfall forecast. Excel finds the first flagged hour and shows how many arrivals and departures are scheduled in that window.
 2. **Record the supplier’s confirmation.** The reviewer enters the available loader weight and whether preseason training was confirmed. The input is keyed to the forecast window, so a different hour requires a fresh confirmation.
